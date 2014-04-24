@@ -21,6 +21,7 @@
 #endif
 
 #include <string.h>
+#include <unistd.h>
 #include <gst/gst.h>
 #include <gio/gio.h>
 
@@ -41,6 +42,7 @@ static GList *clients = NULL;
 static GstElement *pipeline = NULL;
 static GstElement *multisocketsink = NULL;
 static gboolean started = FALSE;
+static gchar *mime = NULL;
 
 static void
 remove_client (Client * client)
@@ -126,7 +128,7 @@ client_message (Client * client, const gchar * data, guint len)
       http_version = "HTTP/1.0";
 
     if (parts[1] && strcmp (parts[1], "/") == 0) {
-      response = g_strdup_printf ("%s 200 OK\r\n" "\r\n", http_version);
+      response = g_strdup_printf ("%s 200 OK\r\n" "Content-Type: %s\r\n" "\r\n", http_version, mime);
       ok = TRUE;
     } else {
       response = g_strdup_printf ("%s 404 Not Found\r\n\r\n", http_version);
@@ -347,8 +349,14 @@ main (gint argc, gchar ** argv)
   GSocketService *service;
   GstElement *bin, *stream;
   GstPad *srcpad, *ghostpad, *sinkpad;
+  GstCaps *srccaps;
   GError *err = NULL;
   GstBus *bus;
+
+  if (daemon (0, 0) == -1) {
+    g_print ("Cannot detach!\n");
+    return -1;
+  }
 
   gst_init (&argc, &argv);
 
@@ -379,6 +387,24 @@ main (gint argc, gchar ** argv)
     gst_object_unref (stream);
     gst_object_unref (bin);
     return -4;
+  }
+
+  srccaps = gst_pad_get_pad_template_caps (srcpad);
+  if (!srccaps) {
+    g_print ("no caps on \"src\" pad in element \"stream\"\n");
+    gst_object_unref (stream);
+    gst_object_unref (bin);
+    gst_object_unref (srcpad);
+    return -5;
+  }
+  else { /* Define mime type based on caps */
+    GstStructure *s = gst_caps_get_structure (srccaps, 0);
+
+    mime = g_strdup (gst_structure_get_name (s));
+
+    gst_caps_unref (srccaps);
+
+    g_print ("mime type defined to %s\n", mime);
   }
 
   ghostpad = gst_ghost_pad_new ("src", srcpad);
@@ -432,6 +458,8 @@ main (gint argc, gchar ** argv)
   g_print ("Listening on http://127.0.0.1:8080/\n");
 
   g_main_loop_run (loop);
+
+  g_free (mime);
 
   g_socket_service_stop (service);
   g_object_unref (service);
