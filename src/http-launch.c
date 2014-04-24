@@ -362,7 +362,7 @@ main (gint argc, gchar ** argv)
     FILE *pid_file = NULL;
 
     pid_file = fopen ("/var/run/http-launch.pid", "a+");
-    fprintf (pid_file, "%d", getpid ());
+    fprintf (pid_file, "%d\n", getpid ());
     fclose (pid_file);
   }
 
