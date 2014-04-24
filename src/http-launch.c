@@ -22,6 +22,7 @@
 
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <gst/gst.h>
 #include <gio/gio.h>
 
@@ -356,6 +357,13 @@ main (gint argc, gchar ** argv)
   if (daemon (0, 0) == -1) {
     g_print ("Cannot detach!\n");
     return -1;
+  }
+  else {
+    FILE *pid_file = NULL;
+
+    pid_file = fopen ("/var/run/http-launch.pid", "a+");
+    fprintf (pid_file, "%d", getpid ());
+    fclose (pid_file);
   }
 
   gst_init (&argc, &argv);
