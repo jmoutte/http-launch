@@ -56,7 +56,10 @@ static GstElement *pipeline = NULL;
 static gboolean started = FALSE;
 G_LOCK_DEFINE_STATIC (caps);
 
-#define PIPELINE_DESC "videotestsrc is-live=true ! video/x-raw, width=320, height=240 ! timeoverlay ! x264enc key-int-max=30 ! h264parse ! queue ! matroskamux streamable=true ! multisocketsink name=test"
+/* Maximum in memory buffer duration for flashback */
+#define MAX_FLASHBACK 120
+/* Configure pipeline here, just name the multisocketsink, don't configure them */
+#define PIPELINE_DESC "videotestsrc is-live=true ! video/x-raw, width=640, height=480 ! timeoverlay ! x264enc key-int-max=30 b-adapt=0 ! h264parse ! queue ! matroskamux streamable=true ! multisocketsink name=test"
 
 /* Helper to find regions by id */
 static gint
@@ -212,9 +215,17 @@ client_message (Client * client, const gchar * data, guint len)
           g_print ("adding client using flashback mode\n");
           burst_mode = 4;
           min_value = 30 * GST_SECOND;
-          max_value = -1;
         } else if (!g_strcmp0 (path_parts[2], "feedback")) {
           g_print ("adding client using feedback mode\n");
+        }
+      }
+
+      if (nb_parts > 3 && ret) {
+        const gint offset = (gint) g_ascii_strtoll (path_parts[3], NULL, 10);
+
+        if (offset > 0 && offset < MAX_FLASHBACK) {
+          g_print ("configure flashback offset to %d seconds\n", offset);
+          min_value = offset * GST_SECOND;
         }
       }
 
@@ -418,6 +429,8 @@ on_client_socket_removed (GstElement * element, GSocket * socket,
   GList *l;
   Client *client = NULL;
 
+  g_print ("client socket removed\n");
+
   G_LOCK (clients);
   for (l = clients; l; l = l->next) {
     Client *tmp = l->data;
@@ -536,7 +549,7 @@ main (gint argc, gchar ** argv)
         "units-soft-max", (gint64) 3 * GST_SECOND, /* Recovery procedure starts */
         "recover-policy", 3 /* keyframe */ ,
         "timeout", (guint64) 10 * GST_SECOND,
-        "time-min", (gint64) 120 * GST_SECOND, /* Keep 2 minutes in memory */
+        "time-min", (gint64) MAX_FLASHBACK * GST_SECOND, /* Keep 2 minutes in memory */
         "sync-method", 2 /* latest-keyframe */ ,
         NULL);
 
