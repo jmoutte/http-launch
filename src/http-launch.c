@@ -21,8 +21,18 @@
 #endif
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <gst/gst.h>
 #include <gio/gio.h>
+
+typedef struct
+{
+  GstElement *element;
+  gchar *name;
+  gchar *content_type;
+  gboolean caps_resolved;
+} EndPoint;
 
 typedef struct
 {
@@ -35,23 +45,31 @@ typedef struct
   GByteArray *current_message;
   gchar *http_version;
   gboolean waiting_200_ok;
+  EndPoint *endpoint;
 } Client;
-
-static const char *known_mimetypes[] = {
-  "video/webm",
-  "multipart/x-mixed-replace",
-  NULL
-};
 
 static GMainLoop *loop = NULL;
 G_LOCK_DEFINE_STATIC (clients);
 static GList *clients = NULL;
+static GList *endpoints = NULL;
 static GstElement *pipeline = NULL;
-static GstElement *multisocketsink = NULL;
 static gboolean started = FALSE;
-static gchar *content_type;
 G_LOCK_DEFINE_STATIC (caps);
-static gboolean caps_resolved = FALSE;
+
+#define PIPELINE_DESC "videotestsrc is-live=true ! video/x-raw, width=320, height=240 ! timeoverlay ! x264enc key-int-max=30 ! h264parse ! queue ! matroskamux streamable=true ! multisocketsink name=test"
+
+/* Helper to find regions by id */
+static gint
+endpoint_compare_by_name (EndPoint * endpoint, gchar * name)
+{
+  return g_strcmp0 (endpoint->name, name);
+}
+
+static gint
+endpoint_compare_by_element (EndPoint * endpoint, GstElement * element)
+{
+  return endpoint->element != element;
+}
 
 static void
 remove_client (Client * client)
@@ -106,9 +124,8 @@ write_bytes (Client * client, const gchar * data, guint len)
 static void
 send_response_200_ok (Client * client)
 {
-  gchar *response;
-  response = g_strdup_printf ("%s 200 OK\r\n%s\r\n", client->http_version,
-        content_type);
+  gchar *response = g_strdup_printf ("%s 200 OK\r\n%s\r\n", client->http_version,
+        client->endpoint->content_type);
   write_bytes (client, response, strlen (response));
   g_free (response);
 }
@@ -117,16 +134,31 @@ static void
 send_response_404_not_found (Client * client)
 {
   gchar *response;
+  g_print ("sending 404 error\n");
   response = g_strdup_printf ("%s 404 Not Found\r\n\r\n", client->http_version);
+  write_bytes (client, response, strlen (response));
+  g_free (response);
+
+}
+
+static void
+send_response_400_not_found (Client * client)
+{
+  gchar *response;
+  g_print ("sending 400 error\n");
+  response = g_strdup_printf ("%s 400 Bad Request\r\n\r\n", client->http_version);
   write_bytes (client, response, strlen (response));
   g_free (response);
 }
 
-static void
+static gboolean
 client_message (Client * client, const gchar * data, guint len)
 {
   gboolean http_head_request = FALSE;
   gboolean http_get_request = FALSE;
+  gboolean ret = FALSE;
+  gint burst_mode = 2;
+  guint64 min_value = -1, max_value = -1;
   gchar **lines = g_strsplit_set (data, "\r\n", -1);
 
   if (g_str_has_prefix (lines[0], "HEAD"))
@@ -136,7 +168,6 @@ client_message (Client * client, const gchar * data, guint len)
 
   if (http_head_request || http_get_request) {
     gchar **parts = g_strsplit (lines[0], " ", -1);
-    gboolean ok = FALSE;
 
     g_free (client->http_version);
 
@@ -145,20 +176,54 @@ client_message (Client * client, const gchar * data, guint len)
     else
       client->http_version = g_strdup ("HTTP/1.0");
 
-    if (parts[1] && strcmp (parts[1], "/") == 0) {
-      G_LOCK (caps);
-      if (caps_resolved)
-        send_response_200_ok (client);
-      else
-        client->waiting_200_ok = TRUE;
-      G_UNLOCK (caps);
-      ok = TRUE;
-    } else {
-      send_response_404_not_found (client);
+    g_print ("request : %s\n", parts[1]);
+
+    if (parts[1]) {
+      gchar **path_parts = g_strsplit (parts[1], "/", -1);
+      gint nb_parts = g_strv_length (path_parts);
+
+      g_print ("parts in request %d\n", nb_parts);
+
+      if (nb_parts > 1) {
+        /* Try searching for endpoint with first part */
+        GList *result = g_list_find_custom (endpoints, path_parts[1], (GCompareFunc) endpoint_compare_by_name);
+
+        if (result) {
+          g_print ("found endpoint %p for request part %s\n", result->data, path_parts[1]);
+          client->endpoint = (EndPoint *) result->data;
+
+          G_LOCK (caps);
+          if (client->endpoint->caps_resolved)
+            send_response_200_ok (client);
+          else
+            client->waiting_200_ok = TRUE;
+          G_UNLOCK (caps);
+          ret = TRUE;
+        } else {
+          /* That s a 404 ! */
+          g_print ("no endpoint found for request part %s\n", path_parts[1]);
+          send_response_404_not_found (client);
+        }
+      }
+
+      /* Depending on the second part we add at the end of buffer or in the past */
+      if (nb_parts > 2 && ret) {
+        if (!g_strcmp0 (path_parts[2], "flashback")) {
+          g_print ("adding client using flashback mode\n");
+          burst_mode = 4;
+          min_value = 30 * GST_SECOND;
+          max_value = -1;
+        } else if (!g_strcmp0 (path_parts[2], "feedback")) {
+          g_print ("adding client using feedback mode\n");
+        }
+      }
+
+      g_strfreev (path_parts);
     }
+
     g_strfreev (parts);
 
-    if (ok) {
+    if (ret) {
       if (http_get_request) {
         /* Start streaming to client socket */
         g_source_destroy (client->isource);
@@ -168,7 +233,8 @@ client_message (Client * client, const gchar * data, guint len)
         g_source_unref (client->tosource);
         client->tosource = NULL;
         g_print ("Starting to stream to %s\n", client->name);
-        g_signal_emit_by_name (multisocketsink, "add", client->socket);
+        g_signal_emit_by_name (client->endpoint->element, "add-full", client->socket,
+            burst_mode, GST_FORMAT_TIME, min_value, GST_FORMAT_TIME, max_value);
       }
 
       if (!started) {
@@ -182,23 +248,12 @@ client_message (Client * client, const gchar * data, guint len)
       }
     }
   } else {
-    gchar **parts = g_strsplit (lines[0], " ", -1);
-    gchar *response;
-    const gchar *http_version;
-
-    if (parts[1] && parts[2] && *parts[2] != '\0')
-      http_version = parts[2];
-    else
-      http_version = "HTTP/1.0";
-
-    response = g_strdup_printf ("%s 400 Bad Request\r\n\r\n", http_version);
-    write_bytes (client, response, strlen (response));
-    g_free (response);
-    g_strfreev (parts);
-    remove_client (client);
+    send_response_400_not_found (client);
   }
 
   g_strfreev (lines);
+
+  return ret;
 }
 
 static gboolean
@@ -239,13 +294,18 @@ on_read_bytes (GPollableInputStream * stream, Client * client)
 
         g_byte_array_append (client->current_message, (const guint8 *) "\0", 1);
         len = tmp - client->current_message->data + 5;
-        client_message (client, (gchar *) client->current_message->data, len);
-        g_byte_array_remove_range (client->current_message, 0, len);
-        tmp = client->current_message->data;
-	tmp_len = client->current_message->len;
+        if (client_message (client, (gchar *) client->current_message->data, len)) {
+          g_byte_array_remove_range (client->current_message, 0, len);
+          tmp = client->current_message->data;
+  	      tmp_len = client->current_message->len;
+        }
+        else {
+          g_print ("client message processing generated an error\n");
+          remove_client (client);
+        }
       } else {
         tmp++;
-	tmp_len--;
+	      tmp_len--;
       }
     }
 
@@ -372,60 +432,37 @@ on_client_socket_removed (GstElement * element, GSocket * socket,
     remove_client (client);
 }
 
+/* Identify the endpoint which configured caps, and notify clients
+ * connected to it waiting for content_type */
 static void on_stream_caps_changed (GObject *obj, GParamSpec *pspec,
     gpointer user_data)
 {
-  GstPad *src_pad;
-  GstCaps *src_caps;
-  GstStructure *gstrc;
   GList *l;
+  GstElement *element = gst_pad_get_parent_element (GST_PAD (obj));
 
-  src_pad = (GstPad *) obj;
-  src_caps = gst_pad_get_current_caps (src_pad);
-  gstrc = gst_caps_get_structure (src_caps, 0);
+  l = g_list_find_custom (endpoints, element, (GCompareFunc) endpoint_compare_by_element);
 
-  /*
-   * Include a Content-type header in the case we know the mime
-   * type is OK in HTTP. Required for MJPEG streams.
-   */
-  int i = 0;
-  const gchar *mimetype = gst_structure_get_name(gstrc);
-  while (known_mimetypes[i] != NULL)
-  {
-    if (strcmp(mimetype, known_mimetypes[i]) == 0)
-    {
-      if (content_type)
-        g_free(content_type);
+  if (G_LIKELY (l)) {
+    EndPoint *endpoint = (EndPoint *) l->data;
+    GstPad *src_pad = (GstPad *) obj;
+    GstCaps *src_caps = gst_pad_get_current_caps (src_pad);
+    GstStructure *s = gst_caps_get_structure (src_caps, 0);
 
-      /* Handle the (maybe not so) especial case of multipart to add boundary */
-      if (strcmp(mimetype, "multipart/x-mixed-replace") == 0 &&
-          gst_structure_has_field_typed(gstrc, "boundary", G_TYPE_STRING))
-      {
-        const gchar *boundary = gst_structure_get_string(gstrc, "boundary");
-        content_type = g_strdup_printf ("Content-Type: "
-	          "multipart/x-mixed-replace;boundary=--%s\r\n", boundary);
-      }
-      else
-      {
-        content_type = g_strdup_printf ("Content-Type: %s\r\n", mimetype);
-      }
-      g_print("%s", content_type);
-      break;
-    }
-    i++;
+    endpoint->content_type = g_strdup_printf ("Content-Type: %s\r\n", gst_structure_get_name (s));
+    endpoint->caps_resolved = TRUE;
+
+    g_print ("found content type %s for endpoint %s\n", gst_structure_get_name (s), endpoint->name);
+
+    gst_caps_unref (src_caps);
   }
-
-  gst_caps_unref (src_caps);
 
   /* Send 200 OK to those clients waiting for it */
   G_LOCK (caps);
 
-  caps_resolved = TRUE;
-
   G_LOCK (clients);
   for (l = clients; l; l = l->next) {
     Client *cl = l->data;
-    if (cl->waiting_200_ok) {
+    if (cl->endpoint->element == element && cl->waiting_200_ok) {
       send_response_200_ok (cl);
       cl->waiting_200_ok = FALSE;
       break;
@@ -434,22 +471,35 @@ static void on_stream_caps_changed (GObject *obj, GParamSpec *pspec,
   G_UNLOCK (clients);
 
   G_UNLOCK (caps);
+
+  gst_object_unref (element);
 }
 
 int
 main (gint argc, gchar ** argv)
 {
   GSocketService *service;
-  GstElement *bin, *stream;
-  GstPad *srcpad, *ghostpad, *sinkpad;
   GError *err = NULL;
   GstBus *bus;
+  GstIterator *it;
+
+  /*if (daemon (0, 0) == -1) {
+    g_print ("Cannot detach!\n");
+    return -1;
+  }
+  else {
+    FILE *pid_file = NULL;
+
+    pid_file = fopen ("/var/run/http-launch.pid", "a+");
+    fprintf (pid_file, "%d\n", getpid ());
+    fclose (pid_file);
+  }*/
 
   gst_init (&argc, &argv);
 
-  if (argc < 4) {
-    g_print ("usage: %s PORT <launch line>\n"
-        "example: %s 8080 ( videotestsrc ! theoraenc ! oggmux name=stream )\n",
+  if (argc < 2) {
+    g_print ("usage: %s PORT\n"
+        "example: %s 8080\n",
         argv[0], argv[0]);
     return -1;
   }
@@ -457,62 +507,58 @@ main (gint argc, gchar ** argv)
   const gchar *port_str = argv[1];
   const int port = (int) g_ascii_strtoll(port_str, NULL, 10);
 
-  bin = gst_parse_launchv ((const gchar **) argv + 2, &err);
-  if (!bin) {
+  pipeline = gst_parse_launch (PIPELINE_DESC, &err);
+  if (!pipeline) {
     g_print ("invalid pipeline: %s\n", err->message);
     g_clear_error (&err);
     return -2;
   }
 
-  stream = gst_bin_get_by_name (GST_BIN (bin), "stream");
-  if (!stream) {
-    g_print ("no element with name \"stream\" found\n");
-    gst_object_unref (bin);
-    return -3;
+  /* Find all multisocketsink elements */
+  GValue it_value = G_VALUE_INIT;
+  it = gst_bin_iterate_elements (GST_BIN (pipeline));
+  while (gst_iterator_next (it, &it_value) != GST_ITERATOR_DONE) {
+    GstElementFactory *elm_fact;
+    GstElement *elm = (GstElement *) g_value_get_object (&it_value);
+
+    /* Check factory name */
+    elm_fact = gst_element_get_factory (elm);
+
+    if (!g_ascii_strcasecmp ("multisocketsink", gst_plugin_feature_get_name (elm_fact))) {
+      EndPoint *endpoint = g_new0 (EndPoint, 1);
+      GstPad *pad = gst_element_get_static_pad (elm, "sink");
+
+      g_print ("Found endpoint named %s\n", GST_OBJECT_NAME (elm));
+
+      g_object_set (elm,
+        "unit-format", GST_FORMAT_TIME,
+        "units-max", (gint64) 7 * GST_SECOND, /* Slow clients get dropped when they get that late */
+        "units-soft-max", (gint64) 3 * GST_SECOND, /* Recovery procedure starts */
+        "recover-policy", 3 /* keyframe */ ,
+        "timeout", (guint64) 10 * GST_SECOND,
+        "time-min", (gint64) 120 * GST_SECOND, /* Keep 2 minutes in memory */
+        "sync-method", 2 /* latest-keyframe */ ,
+        NULL);
+
+      g_signal_connect (pad, "notify::caps", G_CALLBACK (on_stream_caps_changed), NULL);
+      g_signal_connect (elm, "client-socket-removed", G_CALLBACK (on_client_socket_removed), NULL);
+
+      endpoint->element = gst_object_ref (elm);
+      endpoint->name = gst_element_get_name (elm);
+
+      endpoints = g_list_append (endpoints, endpoint);
+
+      gst_object_unref (pad);
+    }
+
+    g_value_reset (&it_value);
   }
-
-  srcpad = gst_element_get_static_pad (stream, "src");
-  if (!srcpad) {
-    g_print ("no \"src\" pad in element \"stream\" found\n");
-    gst_object_unref (stream);
-    gst_object_unref (bin);
-    return -4;
-  }
-
-  content_type = g_strdup ("");
-  g_signal_connect (srcpad, "notify::caps",
-                  G_CALLBACK (on_stream_caps_changed),
-                  NULL);
-
-  ghostpad = gst_ghost_pad_new ("src", srcpad);
-  gst_element_add_pad (GST_ELEMENT (bin), ghostpad);
-  gst_object_unref (srcpad);
-
-  pipeline = gst_pipeline_new (NULL);
-
-  multisocketsink = gst_element_factory_make ("multisocketsink", NULL);
-  g_object_set (multisocketsink,
-      "unit-format", GST_FORMAT_TIME,
-      "units-max", (gint64) 7 * GST_SECOND,
-      "units-soft-max", (gint64) 3 * GST_SECOND,
-      "recover-policy", 3 /* keyframe */ ,
-      "timeout", (guint64) 10 * GST_SECOND,
-      "sync-method", 1 /* next-keyframe */ ,
-      NULL);
-
-  gst_bin_add_many (GST_BIN (pipeline), bin, multisocketsink, NULL);
-
-  sinkpad = gst_element_get_static_pad (multisocketsink, "sink");
-  gst_pad_link (ghostpad, sinkpad);
-  gst_object_unref (sinkpad);
+  gst_iterator_free (it);
 
   bus = gst_element_get_bus (pipeline);
   gst_bus_add_signal_watch (bus);
   g_signal_connect (bus, "message", G_CALLBACK (on_message), NULL);
   gst_object_unref (bus);
-
-  g_signal_connect (multisocketsink, "client-socket-removed",
-      G_CALLBACK (on_client_socket_removed), NULL);
 
   loop = g_main_loop_new (NULL, FALSE);
 
@@ -538,6 +584,25 @@ main (gint argc, gchar ** argv)
 
   g_socket_service_stop (service);
   g_object_unref (service);
+
+  /* Lose our references to the endpoints */
+  if (endpoints) {
+    GList *l = endpoints;
+
+    while (l) {
+      EndPoint *endpoint = (EndPoint *) l->data;
+
+      g_free (endpoint->content_type);
+      g_free (endpoint->name);
+      gst_object_unref (endpoint->element);
+      g_free (endpoint);
+
+      l = g_list_next (l);
+    }
+
+    g_list_free (endpoints);
+    endpoints = NULL;
+  }
 
   gst_element_set_state (pipeline, GST_STATE_NULL);
   gst_object_unref (pipeline);
